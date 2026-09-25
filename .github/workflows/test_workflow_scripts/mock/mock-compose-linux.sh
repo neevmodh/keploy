@@ -58,6 +58,30 @@ def get(path):
     with urllib.request.urlopen(DEP + path, timeout=5) as r:
         return json.load(r)
 
+# The agent must refuse a control-plane caller with no credential. Its token
+# reaches it through compose: the generated agent service names it without a
+# value and compose copies it from the environment keploy runs compose in. That
+# handoff fails OPEN — an agent that got no token serves everything and every
+# assertion below still passes — so it is checked here directly, from inside
+# the agent's network namespace, at the address keploy exports for exactly
+# this kind of caller.
+import urllib.error
+AGENT = os.environ.get("KEPLOY_MOCK_AGENT")
+if not AGENT:
+    print("FAILED: keploy did not export KEPLOY_MOCK_AGENT", flush=True)
+    sys.exit(1)
+try:
+    urllib.request.urlopen(urllib.request.Request(
+        AGENT + "/agent/scope/begin", data=json.dumps({"name": "unauthenticated-probe"}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST"), timeout=5).read()
+    print("FAILED: the agent served /agent/scope/begin to a caller with no token", flush=True)
+    sys.exit(1)
+except urllib.error.HTTPError as e:
+    if e.code != 401:
+        print("FAILED: expected 401 for an unauthenticated scope call, got", e.code, flush=True)
+        sys.exit(1)
+print("AGENT REFUSED AN UNAUTHENTICATED CALLER", flush=True)
+
 # keploy rewrites the app's depends_on to condition: service_started, so the
 # dependency may not be listening yet. Retry on /warmup, which the assertions
 # below do NOT count, so a retry can never inflate the recorded mock count.
@@ -79,6 +103,7 @@ print("RUNNER PASSED 3", flush=True)
 sys.exit(EXIT)
 PY
 
+# $1, if given, is one more environment entry for the runner.
 runner_service() {
   cat <<YML
   runner:
@@ -87,7 +112,12 @@ runner_service() {
     working_dir: /w
     volumes: [".:/w"]
     command: python runner.py
+    environment:
+      # Passed through by name, as a user's own compose file would: the
+      # runner needs the agent's address to call its control plane.
+      - KEPLOY_MOCK_AGENT
 YML
+  if [ -n "${1:-}" ]; then echo "      - $1"; fi
 }
 
 { echo "services:"; runner_service; cat <<'YML'
@@ -106,11 +136,18 @@ YML
 { echo "services:"; runner_service; } > docker-compose.nodep.yml
 
 # Same again, but the runner exits non-zero after passing its assertions.
-{ echo "services:"; runner_service; cat <<'YML'
-    environment:
-      RUNNER_EXIT: "7"
-YML
-} > docker-compose.fail.yml
+{ echo "services:"; runner_service RUNNER_EXIT=7; } > docker-compose.fail.yml
+
+# The runner proves the agent refused it (AGENT REFUSED ...). The agent and the
+# CLI each say so too when the token did not arrive, so a run is failed on
+# either of those lines as well.
+assert_agent_guarded() {
+  local log=$1
+  grep -q "AGENT REFUSED AN UNAUTHENTICATED CALLER" "$log" || { echo "FAIL: $log: the runner never saw the agent refuse an unauthenticated call"; FAIL=1; }
+  if grep -qE "running WITHOUT authentication|NOT enforcing control-plane authentication" "$log"; then
+    echo "FAIL: $log: the agent came up without its control-plane token — the compose handoff is broken"; FAIL=1
+  fi
+}
 
 priced_mocks() {
   local n
@@ -122,6 +159,7 @@ echo "== 1. record a compose project =="
 sudo -E env PATH="$PATH" "$RECORD_BIN" mock record \
   -c "docker compose up" --container-name mockc-runner --name e2e --disable-tele 2>&1 | tee rec.log
 grep -q "RUNNER PASSED 3" rec.log || { echo "FAIL: the runner never completed under record"; FAIL=1; }
+assert_agent_guarded rec.log
 MOCKS=$(priced_mocks)
 echo "recorded /price/ mocks: $MOCKS"
 [ "$MOCKS" -eq 3 ] || { echo "FAIL: expected 3 recorded /price/ calls, got $MOCKS — the app was released before the proxy was armed"; FAIL=1; }
@@ -134,6 +172,7 @@ RC=${PIPESTATUS[0]}
 echo "replay exit=$RC"
 [ "$RC" -eq 0 ] || { echo "FAIL: replay should pass entirely from mocks (exit 0), got $RC"; FAIL=1; }
 grep -q "RUNNER PASSED 3" rep.log || { echo "FAIL: the runner did not get all 3 answers from the mock set"; FAIL=1; }
+assert_agent_guarded rep.log
 grep -q "mock replay summary" rep.log || { echo "FAIL: replay reported no outcome at all"; FAIL=1; }
 cleanup
 
